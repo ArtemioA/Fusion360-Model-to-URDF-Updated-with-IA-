@@ -1,9 +1,0 @@
-﻿<?xml version="1.0" encoding="utf-8"?>
-<ApplicationPackage SchemaVersion="1.0" ProductType="Application" AutodeskProduct="Fusion360" Name="ACDC4Robot" Description="ACDC4Robot is an open-sourced add-in for Autodesk Fusion for exporting robot models into URDF, SDFormat, and MJCF" AppVersion="1.0.0" Author="Design and Learning Research Group" AppNameSpace="com.autodesk.exchange.Fusion360 ACDC4Robot" HelpFile="./Contents/docs/Help.html" ProductCode="*" UpgradeCode="{472B69F4-F769-4924-98ED-1BCC4AD553C3}" FriendlyVersion="1.0.0" SupportedLocales="Enu" OnlineDocumentation="https://ancorasir.com/">
-  <CompanyDetails Name="Design and Learning Research Group" Phone=" " Url="https://ancorasir.com/" Email="12233200@mail.sustech.edu.cn" />
-  <RuntimeRequirements SupportPath="./Contents/docs" OS="win64" Platform="Fusion360" />
-  <Components>
-    <RuntimeRequirements SupportPath="./Contents/docs" OS="win64|mac" Platform="Fusion360" />
-    <ComponentEntry AppName="ACDC4Robot" Version="1.0.0" ModuleName="./Contents/ACDC4Robot.manifest" AppDescription="ACDC4Robot" />
-  </Components>
-</ApplicationPackage>
