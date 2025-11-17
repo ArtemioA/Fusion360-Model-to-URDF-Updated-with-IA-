@@ -1,4 +1,4 @@
-import adsk.core 
+import adsk.core
 import adsk.fusion
 import os
 import math
@@ -23,12 +23,10 @@ def _log(ui, msg: str):
             if palette:
                 palette.writeText(full)
     except:
-        # En caso de que algo falle en el logging, no romper la exportación
         print("[ACDC4Robot][LOG-ERROR]", msg)
 
 
 def _sanitize(name: str) -> str:
-    """Limpia nombres para URDF y archivos."""
     if not name:
         return "link"
     bad = '<>:"/\\|?* ,.'
@@ -40,14 +38,12 @@ def _sanitize(name: str) -> str:
 
 
 def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
-    """Convierte Matrix3D de Fusion a (xyz, rpy) en metros.
-       *** ES EL MISMO SISTEMA DEL SCRIPT ANTIGUO QUE TE FUNCIONABA ***"""
+    """Mismo sistema antiguo (cm -> m, misma fórmula de RPY)."""
     if m is None:
         return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
     p = m.translation
     try:
-        # Tu versión antigua usaba cm -> m. Lo mantengo igual para no romper nada.
         scale = design.unitsManager.convert(1.0, "cm", "m")
     except Exception:
         scale = 0.01
@@ -60,7 +56,6 @@ def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
     r21, r22, r23 = m.getCell(1, 0), m.getCell(1, 1), m.getCell(1, 2)
     r31, r32, r33 = m.getCell(2, 0), m.getCell(2, 1), m.getCell(2, 2)
 
-    # roll (X), pitch (Y), yaw (Z) – MISMO ALGORITMO QUE TU SCRIPT BUENO
     if abs(r31) < 1.0:
         pitch = math.asin(-r31)
         roll = math.atan2(r32, r33)
@@ -74,21 +69,11 @@ def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
 
 
 # =========================================================
-# Recogida de cuerpos por occurrence (versión "antigua", por-cuerpo)
+# Recogida de cuerpos por occurrence
 # =========================================================
 
 def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
-    """
-    Devuelve 4 listas:
-      comp_brep_export, occ_brep_export, comp_mesh_export, occ_mesh_export
-
-    NO filtramos por isSolid, solo por visibilidad si se desea.
-    Además saca muchos logs para ver qué pasa con casos como id47:1.
-    """
-
     comp = occ.component
-
-    # --- BREP BODIES ---
 
     comp_brep_all = list(comp.bRepBodies)
     occ_brep_all = list(occ.bRepBodies)
@@ -99,7 +84,6 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
     _log(ui, f"Analizando occurrence '{occ.name}'...")
     _log(ui, f"  [DEBUG] bRep(component) total={len(comp_brep_all)}, bRep(occurrence) total={len(occ_brep_all)}")
 
-    # 1º preferimos cuerpos de la occurrence (proxies)
     for b in occ_brep_all:
         try:
             is_solid = getattr(b, "isSolid", None)
@@ -108,17 +92,11 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
             is_solid = None
             is_visible = None
 
-        # No filtramos por isSolid; podrías filtrar por visibilidad si quieres.
         export = True
-        # if is_visible is False:
-        #     export = False
-
         _log(ui, f"    [occ.bRep] body='{b.name}' isSolid={is_solid} visible={is_visible} -> export={export}")
-
         if export:
             occ_brep_export.append(b)
 
-    # Si no hay cuerpos en la occurrence, usamos los del componente
     if not occ_brep_export:
         for b in comp_brep_all:
             try:
@@ -129,15 +107,9 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
                 is_visible = None
 
             export = True
-            # if is_visible is False:
-            #     export = False
-
             _log(ui, f"    [comp.bRep] body='{b.name}' isSolid={is_solid} visible={is_visible} -> export={export}")
-
             if export:
                 comp_brep_export.append(b)
-
-    # --- MESH BODIES ---
 
     comp_mesh_all = list(getattr(comp, "meshBodies", []))
     occ_mesh_all = list(getattr(occ, "meshBodies", []))
@@ -150,8 +122,6 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
     for m in occ_mesh_all:
         vis = getattr(m, "isVisible", None)
         export = True
-        # if vis is False:
-        #     export = False
         _log(ui, f"    [occ.mesh] body='{m.name}' visible={vis} -> export={export}")
         if export:
             occ_mesh_export.append(m)
@@ -160,8 +130,6 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
         for m in comp_mesh_all:
             vis = getattr(m, "isVisible", None)
             export = True
-            # if vis is False:
-            #     export = False
             _log(ui, f"    [comp.mesh] body='{m.name}' visible={vis} -> export={export}")
             if export:
                 comp_mesh_export.append(m)
@@ -195,15 +163,6 @@ def _collect_bodies_for_occurrence(occ: adsk.fusion.Occurrence, ui):
 # =========================================================
 
 class RobotExporter:
-    """
-    Exporta un diseño Fusion 360 (f3d) a URDF + STL:
-      - Un link por CUERPO (bRep/mesh) dentro de cada occurrence.
-      - Joints de Fusion -> joints URDF.
-      - PARTES SIN JOINTS: fixed a base_link con su pose real.
-      - Raíces de árboles de joints ancladas a base_link.
-      - Si solo hay una pieza sin joints -> URDF de un solo link.
-    """
-
     def __init__(self, robot_name: str, base_output_dir: str = None):
         self.app, self.ui = _get_app_ui()
         if not self.app:
@@ -224,20 +183,13 @@ class RobotExporter:
         self.meshes_dir = os.path.join(self.output_dir, "meshes")
         os.makedirs(self.meshes_dir, exist_ok=True)
 
-        # Cada link puede tener:
-        #   - "occ": occurrence (para saber la pose global)
-        #   - "item": BRepBody o MeshBody concreto que se exportará a STL
-        #   - "mesh": nombre de archivo STL
-        #   - "kind": "brep" o "mesh"
         self.links = []          # [{name, mesh, occ, item, kind}]
         self.joints = []         # [{name,parent,child,type,origin_xyz,origin_rpy,axis,limit}]
-        self.occ_to_link = {}    # occurrenceKey -> link PRINCIPAL (para joints de Fusion)
+        self.occ_to_link = {}    # occurrenceKey -> main link name
         self.base_link_name = None
         self.single_link_no_joints = False
 
-    # -----------------------------------------------------
-    # Public API
-    # -----------------------------------------------------
+    # ------------------------------
 
     def export_all(self):
         try:
@@ -251,9 +203,7 @@ class RobotExporter:
             self._log(msg, also_messagebox=True)
             raise
 
-    # -----------------------------------------------------
-    # Logging
-    # -----------------------------------------------------
+    # ------------------------------
 
     def _log(self, msg: str, also_messagebox: bool = False):
         _log(self.ui, msg)
@@ -262,10 +212,6 @@ class RobotExporter:
                 self.ui.messageBox(msg)
             except:
                 pass
-
-    # -----------------------------------------------------
-    # Helpers
-    # -----------------------------------------------------
 
     def _occ_key(self, occ) -> str:
         if occ is None:
@@ -288,11 +234,6 @@ class RobotExporter:
             return str(id(occ))
 
     def _occ_abs_pose(self, occ):
-        """
-        Pose absoluta (root) de una occurrence.
-        Usa EXACTAMENTE el sistema antiguo: occ.transform2 en global +
-        _matrix_to_xyz_rpy.
-        """
         if not occ:
             return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
         try:
@@ -302,9 +243,7 @@ class RobotExporter:
             pass
         return (0.0, 0.0, 0.0), (0.0, 0.0, 0.0)
 
-    # -----------------------------------------------------
-    # Build links & joints
-    # -----------------------------------------------------
+    # ------------------------------
 
     def _build_links_and_joints(self):
         root = self.design.rootComponent
@@ -312,14 +251,11 @@ class RobotExporter:
 
         self._log(f"[DBG] _build_links_and_joints(): total occurrences = {len(all_occs)}")
 
-        # -----------------------------------------
-        # 1) Crear links por CUERPOS en cada occurrence
-        # -----------------------------------------
+        # 1) Links por cuerpos
         idx = 0
         for occ in all_occs:
             comp_brep, occ_brep, comp_mesh, occ_mesh = _collect_bodies_for_occurrence(occ, self.ui)
 
-            # Preferimos proxies de occurrence; si no, los del componente.
             bodies = occ_brep if occ_brep else comp_brep
             meshes = occ_mesh if occ_mesh else comp_mesh
 
@@ -338,7 +274,6 @@ class RobotExporter:
 
             occ_key = self._occ_key(occ)
 
-            # Link principal de la occurrence (primer cuerpo/mesh)
             main_item = exported_items[0]
             main_name = _sanitize(f"link_{idx}_{occ.name}")
             main_mesh = f"{main_name}.stl"
@@ -354,7 +289,6 @@ class RobotExporter:
             self._log(f"[DBG] Link principal para occurrence '{occ.name}': {main_name} (item='{main_item.name}')")
             idx += 1
 
-            # Links extra para cuerpos adicionales del mismo componente
             for i, extra in enumerate(exported_items[1:], start=1):
                 extra_name = _sanitize(f"link_{idx}_{occ.name}_b{i}_{extra.name}")
                 extra_mesh = f"{extra_name}.stl"
@@ -372,7 +306,6 @@ class RobotExporter:
                     f"  + Extra body link: {extra_name} (body='{extra.name}') fixed a {main_name}"
                 )
 
-                # Joint fijo extra -> principal (sin offset extra, ya que el STL se exporta en coords del body)
                 self.joints.append({
                     "name": f"fixed_extra_{extra_name}",
                     "parent": main_name,
@@ -384,9 +317,7 @@ class RobotExporter:
                     "limit": None,
                 })
 
-        # -----------------------------------------
-        # 1.b) Cuerpos directos en el rootComponent (normal parts)
-        # -----------------------------------------
+        # 1.b) Cuerpos sueltos en root
         try:
             root_bodies = [b for b in root.bRepBodies if b.isSolid]
         except:
@@ -398,7 +329,7 @@ class RobotExporter:
             self.links.append({
                 "name": link_name,
                 "mesh": mesh_name,
-                "occ": None,     # no hay occurrence
+                "occ": None,
                 "item": body,
                 "kind": "brep",
             })
@@ -409,16 +340,13 @@ class RobotExporter:
 
         has_fusion_joints = self._has_fusion_joints(root)
 
-        # Caso especial: una sola pieza sin joints
         if not has_fusion_joints and len(self.links) == 1:
             self.single_link_no_joints = True
             self.base_link_name = None
             self._log("[ACDC4Robot] Una sola pieza sin joints -> URDF con un solo link.")
             return
 
-        # -----------------------------------------
-        # 2) Crear base_link virtual en el origen
-        # -----------------------------------------
+        # 2) base_link
         self.base_link_name = "base_link"
         self.links.insert(0, {
             "name": self.base_link_name,
@@ -429,28 +357,20 @@ class RobotExporter:
         })
         self._log("[ACDC4Robot] base_link creado en el origen.")
 
-        # -----------------------------------------
-        # 3) Joints desde Fusion
-        # -----------------------------------------
+        # 3) Joints de Fusion (solo móviles; rígidos se ignoran)
         if has_fusion_joints:
             self._create_joints_from_fusion()
 
-        # Conjuntos para saber quién participa en joints (incluye fijos extra)
         joint_children = {j["child"] for j in self.joints}
         joint_parents = {j["parent"] for j in self.joints}
 
-        # -----------------------------------------
-        # 4) Partes que NO participan en ningún joint -> fixed a base_link con pose absoluta
-        #    - Para occurrences: usa _occ_abs_pose(occ).
-        #    - Para root bodies: origin = 0 (el STL ya está en coords del root).
-        # -----------------------------------------
+        # 4) Links que no salen en ningún joint -> fixed a base_link con pose absoluta
         for link in self.links:
             name = link["name"]
             if name == self.base_link_name:
                 continue
             if name not in joint_children and name not in joint_parents:
                 occ = link.get("occ")
-
                 if occ is not None:
                     xyz, rpy = self._occ_abs_pose(occ)
                 else:
@@ -466,13 +386,10 @@ class RobotExporter:
                     "axis": (0.0, 0.0, 1.0),
                     "limit": None,
                 })
-                self._log(f"[ACDC4Robot] Joint fijo (sin joints) base_link -> {name}  "
-                          f"XYZ={xyz}  RPY={rpy}")
+                self._log(f"[ACDC4Robot] Joint fijo (sin joints) base_link -> {name} XYZ={xyz} RPY={rpy}")
 
-        # -----------------------------------------
-        # 5) Raíces de árboles de joints (padres que nunca son hijos) -> anclar a base_link
-        # -----------------------------------------
-        joint_children = {j["child"] for j in self.joints}  # actualizado
+        # 5) Raíces de árboles de joints (por si quedan)
+        joint_children = {j["child"] for j in self.joints}
         for link in self.links:
             name = link["name"]
             if name == self.base_link_name:
@@ -481,7 +398,6 @@ class RobotExporter:
                 already = any(j["child"] == name for j in self.joints)
                 if not already:
                     occ = link.get("occ")
-
                     if occ is not None:
                         xyz, rpy = self._occ_abs_pose(occ)
                     else:
@@ -497,8 +413,7 @@ class RobotExporter:
                         "axis": (0.0, 0.0, 1.0),
                         "limit": None,
                     })
-                    self._log(f"[ACDC4Robot] Joint fijo (root joint tree) base_link -> {name}  "
-                              f"XYZ={xyz}  RPY={rpy}")
+                    self._log(f"[ACDC4Robot] Joint fijo (root joint tree) base_link -> {name} XYZ={xyz} RPY={rpy}")
 
     def _has_fusion_joints(self, root) -> bool:
         try:
@@ -514,7 +429,7 @@ class RobotExporter:
         return False
 
     # -----------------------------------------------------
-    # Fusion joints -> URDF
+    # Fusion joints -> URDF (solo móviles)
     # -----------------------------------------------------
 
     def _create_joints_from_fusion(self):
@@ -552,10 +467,16 @@ class RobotExporter:
                 if not l1 or not l2:
                     continue
 
+                jtype, axis, limit = self._map_joint_type_axis_limit(j, JointTypes)
+
+                # *** CLAVE: ignorar joints rígidos (no afectan a la pose absoluta) ***
+                if jtype == "fixed":
+                    self._log(self.ui, f"[DBG] Joint rígido ignorado: {getattr(j,'name','(sin nombre)')}")
+                    continue
+
                 parent, child = self._pick_parent_child(l1, l2, used_children)
                 used_children.add(child)
 
-                jtype, axis, limit = self._map_joint_type_axis_limit(j, JointTypes)
                 ox, oy, oz, rr, pp, yy = self._get_joint_origin_from_fusion(j)
 
                 j_name = _sanitize(getattr(j, "name", "") or f"joint_{parent}_to_{child}")
@@ -570,16 +491,16 @@ class RobotExporter:
                     "axis": axis,
                     "limit": limit,
                 })
-                self._log(f"[ACDC4Robot] Joint Fusion -> URDF: {j_name} ({jtype}) {parent}->{child} "
+                self._log(f"[ACDC4Robot] Joint móvil Fusion -> URDF: {j_name} ({jtype}) {parent}->{child} "
                           f"origin=({ox},{oy},{oz}) rpy=({rr},{pp},{yy})")
             except Exception:
                 self._log("[ACDC4Robot] Error procesando joint Fusion:\n" + traceback.format_exc())
 
     def _pick_parent_child(self, l1: str, l2: str, used_children: set):
         if l1 in used_children and l2 not in used_children:
-            return l2, l1
-        if l2 in used_children and l1 not in used_children:
             return l1, l2
+        if l2 in used_children and l1 not in used_children:
+            return l2, l1
         return (l1, l2) if l1 < l2 else (l2, l1)
 
     def _map_joint_type_axis_limit(self, j, JointTypes):
@@ -601,7 +522,6 @@ class RobotExporter:
             except:
                 pass
 
-        # Axis
         try:
             if motion and hasattr(motion, "rotationAxisVector"):
                 av = motion.rotationAxisVector
@@ -616,7 +536,6 @@ class RobotExporter:
         if length > 1e-6:
             axis = (axis[0] / length, axis[1] / length, axis[2] / length)
 
-        # Limits
         if jtype == "revolute":
             rl = getattr(motion, "rotationLimits", None)
             if rl:
@@ -646,7 +565,6 @@ class RobotExporter:
         return jtype, axis, limit
 
     def _get_joint_origin_from_fusion(self, j):
-        """Origen aproximado desde geometryOrOriginTwo."""
         try:
             geo = getattr(j, "geometryOrOriginTwo", None)
             if geo and hasattr(geo, "transform"):
@@ -670,8 +588,6 @@ class RobotExporter:
 
             item = link.get("item")
             occ = link.get("occ")
-
-            # AHORA: exportamos SIEMPRE el cuerpo/mesh concreto, NO la occurrence completa.
             export_target = item if item is not None else occ
             if not export_target:
                 continue
@@ -681,7 +597,6 @@ class RobotExporter:
             try:
                 stl_opts = export_mgr.createSTLExportOptions(export_target, stl_path)
                 try:
-                    # Alta calidad si está disponible
                     stl_opts.meshRefinement = adsk.fusion.MeshRefinementOptions.High
                 except:
                     try:
@@ -716,7 +631,6 @@ class RobotExporter:
         urdf_path = os.path.join(self.output_dir, f"{self.robot_name}.urdf")
         lines = [f'<robot name="{self.robot_name}">']
 
-        # Caso simple: una sola pieza sin joints
         if self.single_link_no_joints and len(self.links) == 1:
             link = self.links[0]
             name = link["name"]
@@ -739,13 +653,11 @@ class RobotExporter:
             self._log(f"[ACDC4Robot] URDF generado (modelo único): {urdf_path}")
             return
 
-        # Links
         for link in self.links:
             name = link["name"]
             mesh = link.get("mesh")
 
             lines.append(f'  <link name="{name}">')
-
             if mesh:
                 lines.append('    <visual>')
                 lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
@@ -754,7 +666,6 @@ class RobotExporter:
                     f'scale="0.001 0.001 0.001"/></geometry>'
                 )
                 lines.append('    </visual>')
-
                 lines.append('    <collision>')
                 lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
                 lines.append(
@@ -762,16 +673,12 @@ class RobotExporter:
                     f'scale="0.001 0.001 0.001"/></geometry>'
                 )
                 lines.append('    </collision>')
-
-            # Inercia dummy
             lines.append('    <inertial>')
             lines.append('      <mass value="1.0"/>')
             lines.append('      <inertia ixx="1" ixy="0" ixz="0" iyy="1" iyz="0" izz="1"/>')
             lines.append('    </inertial>')
-
             lines.append('  </link>')
 
-        # Joints
         for j in self.joints:
             name = j["name"]
             parent = j["parent"]
@@ -786,16 +693,13 @@ class RobotExporter:
             lines.append(f'    <origin xyz="{ox} {oy} {oz}" rpy="{rr} {pp} {yy}"/>')
             lines.append(f'    <parent link="{parent}"/>')
             lines.append(f'    <child link="{child}"/>')
-
             if jtype in ("revolute", "continuous", "prismatic"):
                 lines.append(f'    <axis xyz="{ax} {ay} {az}"/>')
-
             if limit is not None and jtype in ("revolute", "prismatic"):
                 lo, hi = limit
                 if jtype == "revolute":
                     lo, hi = self._normalize_angle_limits(lo, hi)
                 lines.append(f'    <limit lower="{lo}" upper="{hi}" effort="10" velocity="1"/>')
-
             lines.append('  </joint>')
 
         lines.append('</robot>')
@@ -807,14 +711,10 @@ class RobotExporter:
 
 
 # =========================================================
-# Entrada pública para ACDC4Robot
+# Entrada pública
 # =========================================================
 
 def export_robot(robot_name: str = "acdc_robot", base_output_dir: str = None, *args, **kwargs):
-    """
-    from core import robot
-    robot.export_robot("mi_robot")
-    """
     if robot_name is None and args:
         robot_name = args[0]
     if base_output_dir is None and len(args) > 1:
