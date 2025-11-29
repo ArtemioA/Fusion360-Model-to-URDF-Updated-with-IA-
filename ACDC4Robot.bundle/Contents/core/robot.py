@@ -1,4 +1,4 @@
-import adsk.core 
+import adsk.core
 import adsk.fusion
 import os
 import math
@@ -44,6 +44,7 @@ def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
 
     p = m.translation
     try:
+        # Fusion internamente trabaja en cm, convertimos a m
         scale = design.unitsManager.convert(1.0, "cm", "m")
     except Exception:
         scale = 0.01
@@ -180,6 +181,7 @@ class RobotExporter:
             base_output_dir = os.path.join(home, "Desktop")
 
         self.output_dir = os.path.join(base_output_dir, f"{self.robot_name}_urdf")
+        # Reutilizamos la carpeta "meshes", pero ahora contendrá .dae
         self.meshes_dir = os.path.join(self.output_dir, "meshes")
         os.makedirs(self.meshes_dir, exist_ok=True)
 
@@ -195,7 +197,7 @@ class RobotExporter:
         try:
             self._log(f"=== EXPORTANDO '{self.robot_name}' ===")
             self._build_links_and_joints()
-            self._export_meshes()
+            self._export_dae_meshes()
             self._write_urdf()
             self._log(f"[ACDC4Robot] Export completado en: {self.output_dir}")
         except Exception:
@@ -276,7 +278,8 @@ class RobotExporter:
 
             main_item = exported_items[0]
             main_name = _sanitize(f"link_{idx}_{occ.name}")
-            main_mesh = f"{main_name}.stl"
+            # 🔁 AHORA usamos extensión .dae
+            main_mesh = f"{main_name}.dae"
 
             self.links.append({
                 "name": main_name,
@@ -291,7 +294,7 @@ class RobotExporter:
 
             for i, extra in enumerate(exported_items[1:], start=1):
                 extra_name = _sanitize(f"link_{idx}_{occ.name}_b{i}_{extra.name}")
-                extra_mesh = f"{extra_name}.stl"
+                extra_mesh = f"{extra_name}.dae"
 
                 self.links.append({
                     "name": extra_name,
@@ -325,7 +328,7 @@ class RobotExporter:
 
         for i, body in enumerate(root_bodies):
             link_name = _sanitize(f"root_body_{i}_{body.name}")
-            mesh_name = f"{link_name}.stl"
+            mesh_name = f"{link_name}.dae"
             self.links.append({
                 "name": link_name,
                 "mesh": mesh_name,
@@ -576,11 +579,174 @@ class RobotExporter:
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     # -----------------------------------------------------
-    # STL export
+    # DAE export (BRep/Mesh -> Collada)
     # -----------------------------------------------------
 
-    def _export_meshes(self):
-        export_mgr = self.design.exportManager
+    def _get_mesh_triangles_from_body(self, body):
+        """
+        Devuelve (vertices_m, indices) para un BRepBody o MeshBody.
+        - vertices_m: [x1,y1,z1,x2,y2,z2,...] en metros
+        - indices: [i1,i2,i3,...] (triángulos)
+        """
+        # Intentamos detectarlo como BRepBody
+        is_brep = hasattr(body, "meshManager")
+        is_mesh_body = hasattr(body, "mesh")
+
+        coords = []
+        indices = []
+
+        try:
+            if is_brep:
+                mesh_mgr = body.meshManager
+                mesh = None
+                # Distintas APIs según versión de Fusion
+                try:
+                    # API moderna
+                    tri_opts = adsk.fusion.TriangleMeshQualityOptions()
+                    mesh = mesh_mgr.createMesh(tri_opts)
+                except:
+                    # Fallback: usar displayMeshes
+                    try:
+                        if mesh_mgr.displayMeshes.count > 0:
+                            mesh = mesh_mgr.displayMeshes.item(0)
+                    except:
+                        pass
+
+                if not mesh:
+                    raise RuntimeError("No se pudo obtener el mesh del BRepBody.")
+
+                try:
+                    coords = list(mesh.nodeCoordinatesAsFloat)
+                except:
+                    coords = list(mesh.nodeCoordinates)
+
+                indices = list(mesh.nodeIndices)
+
+            elif is_mesh_body:
+                # MeshBody: tomamos su mesh interno
+                mb = body
+                mesh = None
+                try:
+                    mesh = mb.mesh
+                except:
+                    try:
+                        mesh = mb.displayMesh
+                    except:
+                        pass
+
+                if not mesh:
+                    raise RuntimeError("No se pudo obtener el mesh de MeshBody.")
+
+                try:
+                    coords = list(mesh.nodeCoordinatesAsFloat)
+                except:
+                    coords = list(mesh.nodeCoordinates)
+
+                indices = list(mesh.nodeIndices)
+
+            else:
+                raise RuntimeError("Tipo de body no soportado para extracción de malla.")
+
+        except Exception as e:
+            self._log(f"[ACDC4Robot] Error obteniendo malla: {e}")
+            return [], []
+
+        # Convertimos de cm -> m (como en _matrix_to_xyz_rpy)
+        try:
+            scale = self.design.unitsManager.convert(1.0, "cm", "m")
+        except Exception:
+            scale = 0.01
+
+        verts_m = []
+        for i in range(0, len(coords), 3):
+            x = coords[i] * scale
+            y = coords[i + 1] * scale
+            z = coords[i + 2] * scale
+            verts_m.extend([x, y, z])
+
+        return verts_m, indices
+
+    def _write_dae(self, filepath: str, vertices: list, indices: list):
+        """
+        Escribe un Collada 1.4.1 muy simple con una sola geometría y un solo <triangles>.
+        """
+        if not vertices or not indices:
+            self._log(f"[ACDC4Robot] _write_dae(): malla vacía, se omite {filepath}")
+            return
+
+        geom_id = os.path.splitext(os.path.basename(filepath))[0]
+        pos_id = f"{geom_id}-positions"
+        pos_array_id = f"{pos_id}-array"
+        verts_count = len(vertices)
+        tris_count = len(indices) // 3
+
+        # Strings
+        verts_str = " ".join(f"{v:.9g}" for v in vertices)
+        indices_str = " ".join(str(int(i)) for i in indices)
+
+        dae = f"""<?xml version="1.0" encoding="utf-8"?>
+<COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
+  <asset>
+    <contributor>
+      <authoring_tool>ACDC4Robot DAE Exporter</authoring_tool>
+    </contributor>
+    <unit name="meter" meter="1.0"/>
+    <up_axis>Z_UP</up_axis>
+  </asset>
+
+  <library_geometries>
+    <geometry id="{geom_id}" name="{geom_id}">
+      <mesh>
+        <source id="{pos_id}">
+          <float_array id="{pos_array_id}" count="{verts_count}">{verts_str}</float_array>
+          <technique_common>
+            <accessor source="#{pos_array_id}" count="{verts_count // 3}" stride="3">
+              <param name="X" type="float"/>
+              <param name="Y" type="float"/>
+              <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+
+        <vertices id="{geom_id}-vertices">
+          <input semantic="POSITION" source="#{pos_id}"/>
+        </vertices>
+
+        <triangles count="{tris_count}">
+          <input semantic="VERTEX" source="#{geom_id}-vertices" offset="0"/>
+          <p>{indices_str}</p>
+        </triangles>
+      </mesh>
+    </geometry>
+  </library_geometries>
+
+  <library_visual_scenes>
+    <visual_scene id="Scene" name="Scene">
+      <node id="{geom_id}-node" name="{geom_id}">
+        <instance_geometry url="#{geom_id}"/>
+      </node>
+    </visual_scene>
+  </library_visual_scenes>
+
+  <scene>
+    <instance_visual_scene url="#Scene"/>
+  </scene>
+</COLLADA>
+"""
+        try:
+            with open(filepath, "w", encoding="utf-8") as f:
+                f.write(dae)
+            self._log(f"[ACDC4Robot] DAE generado: {filepath}")
+        except Exception as e:
+            self._log(f"[ACDC4Robot] Error escribiendo DAE '{filepath}': {e}")
+
+    def _export_dae_meshes(self):
+        """
+        Reemplaza el antiguo _export_meshes() que usaba exportManager a STL.
+        Ahora:
+          - extrae la malla de cada BRepBody/MeshBody
+          - la escribe como .dae
+        """
         for link in self.links:
             mesh_name = link.get("mesh")
             if not mesh_name:
@@ -588,29 +754,23 @@ class RobotExporter:
 
             item = link.get("item")
             occ = link.get("occ")
+
+            # Solo usamos 'item' (BRepBody o MeshBody); si no hay, intentamos occ
             export_target = item if item is not None else occ
-            if not export_target:
+            if export_target is None:
                 continue
 
-            stl_path = os.path.join(self.meshes_dir, mesh_name)
+            dae_path = os.path.join(self.meshes_dir, mesh_name)
 
             try:
-                stl_opts = export_mgr.createSTLExportOptions(export_target, stl_path)
-                try:
-                    stl_opts.meshRefinement = adsk.fusion.MeshRefinementOptions.High
-                except:
-                    try:
-                        stl_opts.meshRefinement = adsk.fusion.MeshRefinementSettings.MeshRefinementHigh
-                    except:
-                        pass
-                if hasattr(stl_opts, "isBinaryFormat"):
-                    stl_opts.isBinaryFormat = True
-
-                export_mgr.execute(stl_opts)
-                self._log(f"[ACDC4Robot] STL generado: {stl_path}")
+                verts, idxs = self._get_mesh_triangles_from_body(export_target)
+                if not verts or not idxs:
+                    self._log(f"[ACDC4Robot] Sin malla para {link.get('name', '?')}, DAE omitido.")
+                    continue
+                self._write_dae(dae_path, verts, idxs)
             except Exception:
                 self._log(
-                    f"[ACDC4Robot] Error exportando STL para {link.get('name', '?')}:\n"
+                    f"[ACDC4Robot] Error exportando DAE para {link.get('name', '?')}:\n"
                     + traceback.format_exc()
                 )
 
@@ -640,9 +800,10 @@ class RobotExporter:
             if mesh:
                 lines.append('    <visual>')
                 lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
+                # AHORA el .dae ya viene en metros => scale=1
                 lines.append(
                     f'      <geometry><mesh filename="meshes/{mesh}" '
-                    f'scale="0.001 0.001 0.001"/></geometry>'
+                    f'scale="1 1 1"/></geometry>'
                 )
                 lines.append('    </visual>')
             lines.append('  </link>')
@@ -663,14 +824,14 @@ class RobotExporter:
                 lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
                 lines.append(
                     f'      <geometry><mesh filename="meshes/{mesh}" '
-                    f'scale="0.001 0.001 0.001"/></geometry>'
+                    f'scale="1 1 1"/></geometry>'
                 )
                 lines.append('    </visual>')
                 lines.append('    <collision>')
                 lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
                 lines.append(
                     f'      <geometry><mesh filename="meshes/{mesh}" '
-                    f'scale="0.001 0.001 0.001"/></geometry>'
+                    f'scale="1 1 1"/></geometry>'
                 )
                 lines.append('    </collision>')
             lines.append('    <inertial>')
