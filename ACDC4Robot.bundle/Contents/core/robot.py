@@ -3,6 +3,8 @@ import adsk.fusion
 import os
 import math
 import traceback
+import struct
+import zlib
 
 # =========================================================
 # Utility functions
@@ -67,6 +69,136 @@ def _matrix_to_xyz_rpy(m: adsk.core.Matrix3D, design) -> tuple:
         yaw = math.atan2(-r12, r22)
 
     return (x, y, z), (roll, pitch, yaw)
+
+
+# =========================================================
+# PNG helpers
+# =========================================================
+
+def _png_write_rgba(filepath: str, width: int, height: int, pixels_rgba: bytes):
+    """
+    Escribe un PNG RGBA simple (8 bits por canal) sin librerías externas.
+    pixels_rgba: width * height * 4 bytes
+    """
+    raw = bytearray()
+    stride = width * 4
+    for y in range(height):
+        raw.append(0)  # filter type 0
+        start = y * stride
+        raw.extend(pixels_rgba[start:start + stride])
+
+    compressed = zlib.compress(bytes(raw), 9)
+
+    def chunk(chunk_type: str, data: bytes) -> bytes:
+        length = struct.pack(">I", len(data))
+        ctype = chunk_type.encode("ascii")
+        crc = zlib.crc32(ctype + data) & 0xffffffff
+        crc_bytes = struct.pack(">I", crc)
+        return length + ctype + data + crc_bytes
+
+    ihdr_data = struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0)  # 8bit, RGBA
+    png = b"\x89PNG\r\n\x1a\n"
+    png += chunk("IHDR", ihdr_data)
+    png += chunk("IDAT", compressed)
+    png += chunk("IEND", b"")
+
+    with open(filepath, "wb") as f:
+        f.write(png)
+
+
+def _build_faces_atlas_png(png_path: str, face_colors: list, cell_px: int = 32):
+    """
+    face_colors: lista de (r,g,b,a) en [0..1] por cara.
+    Genera un atlas en grid (celdas cell_px x cell_px) y devuelve:
+      (width, height, uv_centers) donde
+      uv_centers[i] = (u,v) centro del patch de la cara i.
+
+    IMPORTANTE:
+      - La imagen PNG se escribe fila 0 = arriba.
+      - La mayoría de visores 3D interpretan v=0 = abajo.
+      - Por eso invertimos V al calcular los UVs para que
+        cada cara apunte al patch correcto (sin “colores cruzados”).
+    """
+    n = len(face_colors)
+    if n <= 0:
+        return None, None, []
+
+    cols = max(1, int(math.ceil(math.sqrt(n))))
+    rows = int(math.ceil(n / cols))
+
+    width = cols * cell_px
+    height = rows * cell_px
+
+    pixels = bytearray(width * height * 4)
+
+    # Pintamos cada celda
+    for idx, col in enumerate(face_colors):
+        if col is None:
+            r = g = b = 0.7
+            a = 1.0
+        else:
+            r, g, b, a = col
+
+        ir = max(0, min(255, int(round(r * 255))))
+        ig = max(0, min(255, int(round(g * 255))))
+        ib = max(0, min(255, int(round(b * 255))))
+        ia = max(0, min(255, int(round(a * 255))))
+
+        c = idx % cols
+        r_row = idx // cols
+
+        x0 = c * cell_px
+        y0 = r_row * cell_px
+
+        for yy in range(y0, min(y0 + cell_px, height)):
+            for xx in range(x0, min(x0 + cell_px, width)):
+                off = (yy * width + xx) * 4
+                pixels[off:off + 4] = bytes((ir, ig, ib, ia))
+
+    _png_write_rgba(png_path, width, height, bytes(pixels))
+
+    # UV centers con V invertida
+    uv_centers = []
+    for idx in range(n):
+        c = idx % cols
+        r_row = idx // cols
+
+        # U tal cual (izquierda -> derecha)
+        u0 = c / cols
+        u1 = (c + 1) / cols
+        u = 0.5 * (u0 + u1)
+
+        # Coordenadas en espacio "imagen" (fila 0 = arriba)
+        v0_img = r_row / rows
+        v1_img = (r_row + 1) / rows
+        v_img_center = 0.5 * (v0_img + v1_img)
+
+        # Flip vertical a espacio UV (v=0 abajo, v=1 arriba)
+        v = 1.0 - v_img_center
+
+        uv_centers.append((u, v))
+
+    return width, height, uv_centers
+
+
+def _build_solid_png(png_path: str, color: tuple, size: int = 4):
+    """
+    Genera una textura pequeña sólida (size x size) con el color dado.
+    color: (r,g,b,a) en [0..1]
+    """
+    if color is None:
+        r = g = b = 0.7
+        a = 1.0
+    else:
+        r, g, b, a = color
+
+    ir = max(0, min(255, int(round(r * 255))))
+    ig = max(0, min(255, int(round(g * 255))))
+    ib = max(0, min(255, int(round(b * 255))))
+    ia = max(0, min(255, int(round(a * 255))))
+
+    pixels = bytes((ir, ig, ib, ia)) * (size * size)
+    _png_write_rgba(png_path, size, size, pixels)
 
 
 # =========================================================
@@ -181,7 +313,7 @@ class RobotExporter:
             base_output_dir = os.path.join(home, "Desktop")
 
         self.output_dir = os.path.join(base_output_dir, f"{self.robot_name}_urdf")
-        # Reutilizamos la carpeta "meshes", pero ahora contendrá .dae
+        # Carpeta "meshes" con .dae y .png
         self.meshes_dir = os.path.join(self.output_dir, "meshes")
         os.makedirs(self.meshes_dir, exist_ok=True)
 
@@ -278,7 +410,6 @@ class RobotExporter:
 
             main_item = exported_items[0]
             main_name = _sanitize(f"link_{idx}_{occ.name}")
-            # 🔁 AHORA usamos extensión .dae
             main_mesh = f"{main_name}.dae"
 
             self.links.append({
@@ -472,7 +603,7 @@ class RobotExporter:
 
                 jtype, axis, limit = self._map_joint_type_axis_limit(j, JointTypes)
 
-                # *** CLAVE: ignorar joints rígidos (no afectan a la pose absoluta) ***
+                # Ignorar joints rígidos
                 if jtype == "fixed":
                     self._log(self.ui, f"[DBG] Joint rígido ignorado: {getattr(j,'name','(sin nombre)')}")
                     continue
@@ -579,16 +710,223 @@ class RobotExporter:
         return 0.0, 0.0, 0.0, 0.0, 0.0, 0.0
 
     # -----------------------------------------------------
-    # DAE export (BRep/Mesh -> Collada)
+    # DEBUG BREP + COLORES
     # -----------------------------------------------------
 
-    def _get_mesh_triangles_from_body(self, body):
+    def _log_brep_body_properties(self, body):
+        try:
+            cls = getattr(body, "classType", lambda: type(body))()
+        except:
+            cls = type(body)
+
+        name = getattr(body, "name", "(sin nombre)")
+        self._log(f"[DBG][BREP] body='{name}' classType={cls}")
+
+        try:
+            is_solid = getattr(body, "isSolid", None)
+            is_visible = getattr(body, "isVisible", None)
+            self._log(f"[DBG][BREP]   isSolid={is_solid}, isVisible={is_visible}")
+        except:
+            pass
+
+        try:
+            vol = getattr(body, "volume", None)
+            area = getattr(body, "area", None)
+            self._log(f"[DBG][BREP]   volume={vol}, area={area}")
+        except:
+            pass
+
+        try:
+            faces = getattr(body, "faces", None)
+            edges = getattr(body, "edges", None)
+            verts = getattr(body, "vertices", None)
+            if faces:
+                self._log(f"[DBG][BREP]   faces={faces.count}, edges={edges.count}, vertices={verts.count}")
+            if faces and faces.count > 0:
+                max_dump = min(3, faces.count)
+                for i in range(max_dump):
+                    f = faces.item(i)
+                    f_name = getattr(f, "name", f"face_{i}")
+                    f_cls = getattr(f, "classType", lambda: type(f))()
+                    f_area = getattr(f, "area", None)
+                    f_app = getattr(f, "appearance", None)
+                    app_name = f_app.name if f_app else "(sin appearance)"
+                    self._log(f"[DBG][BREP]   face[{i}] name='{f_name}' classType={f_cls}, area={f_area}, appearance={app_name}")
+        except:
+            pass
+
+        try:
+            app = getattr(body, "appearance", None)
+            if app:
+                self._log(f"[DBG][BREP]   body.appearance = '{app.name}'")
+            mat = getattr(body, "material", None)
+            if mat:
+                self._log(f"[DBG][BREP]   body.material = '{mat.name}'")
+        except:
+            pass
+
+    def _get_color_from_appearance(self, app):
         """
-        Devuelve (vertices_m, indices) para un BRepBody o MeshBody.
-        - vertices_m: [x1,y1,z1,x2,y2,z2,...] en metros
-        - indices: [i1,i2,i3,...] (triángulos)
+        Toma un Appearance y busca un ColorProperty.
+        Devuelve (r,g,b,a) en [0..1] o None.
         """
-        # Intentamos detectarlo como BRepBody
+        if not app:
+            return None
+
+        try:
+            props = app.appearanceProperties
+        except:
+            return None
+
+        # 1) propiedad "Color"
+        try:
+            p = props.itemByName("Color")
+            if p:
+                colProp = adsk.core.ColorProperty.cast(p)
+                if colProp and colProp.value:
+                    c = colProp.value
+                    r = c.red / 255.0
+                    g = c.green / 255.0
+                    b = c.blue / 255.0
+                    a_raw = getattr(c, "opacity", 255)
+                    a = a_raw / 255.0
+                    self._log(f"[DBG][COLOR] '{app.name}' prop='Color' -> r={r:.3f}, g={g:.3f}, b={b:.3f}, a={a:.3f}")
+                    return (r, g, b, a)
+        except Exception as e:
+            self._log(f"[DBG][COLOR] Error leyendo 'Color' en '{app.name}': {e}")
+
+        # 2) cualquier ColorProperty
+        try:
+            for i in range(props.count):
+                prop = props.item(i)
+                colProp = adsk.core.ColorProperty.cast(prop)
+                if colProp and colProp.value:
+                    c = colProp.value
+                    r = c.red / 255.0
+                    g = c.green / 255.0
+                    b = c.blue / 255.0
+                    a_raw = getattr(c, "opacity", 255)
+                    a = a_raw / 255.0
+                    self._log(f"[DBG][COLOR] '{app.name}' prop='{prop.name}' -> r={r:.3f}, g={g:.3f}, b={b:.3f}, a={a:.3f}")
+                    return (r, g, b, a)
+        except Exception as e:
+            self._log(f"[DBG][COLOR] Error recorriendo ColorProperty en '{app.name}': {e}")
+
+        return None
+
+    def _extract_color_from_body(self, body):
+        """
+        Color general del cuerpo (NO mira las caras).
+        - body.appearance
+        - body.material.appearance
+        """
+        if not body:
+            return None
+
+        # 1) body.appearance
+        try:
+            app = getattr(body, "appearance", None)
+            if app:
+                col = self._get_color_from_appearance(app)
+                if col:
+                    self._log(f"[DBG][COLOR] Color desde body.appearance '{app.name}' = {col}")
+                    return col
+        except:
+            pass
+
+        # 2) material.appearance
+        try:
+            mat = getattr(body, "material", None)
+            if mat and getattr(mat, "appearance", None):
+                app = mat.appearance
+                col = self._get_color_from_appearance(app)
+                if col:
+                    self._log(f"[DBG][COLOR] Color desde body.material.appearance '{app.name}' = {col}")
+                    return col
+        except:
+            pass
+
+        return None
+
+    def _extract_color_for_link(self, body_or_mesh, occ):
+        """
+        Fallback completo para un link (color "global" del cuerpo):
+          1) body/mesh.appearance o material (sin mirar caras)
+          2) occ.appearance
+          3) occ.component.appearance
+          4) occ.component.material.appearance
+        """
+        # 1) directo desde body/mesh
+        col = self._extract_color_from_body(body_or_mesh)
+        if col:
+            return col
+
+        # 2) appearance directo de la occurrence
+        try:
+            if occ and getattr(occ, "appearance", None):
+                col = self._get_color_from_appearance(occ.appearance)
+                if col:
+                    self._log(f"[DBG][COLOR] Color desde occ.appearance '{occ.appearance.name}' = {col}")
+                    return col
+        except:
+            pass
+
+        # 3) appearance del componente
+        try:
+            if occ and getattr(occ, "component", None) and occ.component.appearance:
+                col = self._get_color_from_appearance(occ.component.appearance)
+                if col:
+                    self._log(f"[DBG][COLOR] Color desde occ.component.appearance '{occ.component.appearance.name}' = {col}")
+                    return col
+        except:
+            pass
+
+        # 4) material del componente
+        try:
+            if occ and getattr(occ, "component", None):
+                mat = getattr(occ.component, "material", None)
+                if mat and getattr(mat, "appearance", None):
+                    col = self._get_color_from_appearance(mat.appearance)
+                    if col:
+                        self._log(f"[DBG][COLOR] Color desde occ.component.material.appearance '{mat.appearance.name}' = {col}")
+                        return col
+        except:
+            pass
+
+        return None
+
+    def _extract_color_for_face(self, face, body, occ):
+        """
+        Color para una cara específica:
+          1) face.appearance
+          2) color global del cuerpo / occ / componente
+        """
+        if face:
+            try:
+                app = getattr(face, "appearance", None)
+                if app:
+                    col = self._get_color_from_appearance(app)
+                    if col:
+                        self._log(f"[DBG][COLOR] Cara -> appearance '{app.name}' = {col}")
+                        return col
+            except:
+                pass
+
+        col = self._extract_color_for_link(body, occ)
+        if col:
+            return col
+
+        return (0.7, 0.7, 0.7, 1.0)
+
+    # -----------------------------------------------------
+    # DAE export (BRep/Mesh -> Collada + PNG textura)
+    # -----------------------------------------------------
+
+    def _get_mesh_triangles_from_body_basic(self, body):
+        """
+        Versión básica: devuelve (vertices_m, indices) para un BRepBody o MeshBody.
+        NO maneja UV ni textura, se usa como fallback.
+        """
         is_brep = hasattr(body, "meshManager")
         is_mesh_body = hasattr(body, "mesh")
 
@@ -597,15 +935,14 @@ class RobotExporter:
 
         try:
             if is_brep:
+                self._log_brep_body_properties(body)
+
                 mesh_mgr = body.meshManager
                 mesh = None
-                # Distintas APIs según versión de Fusion
                 try:
-                    # API moderna
-                    tri_opts = adsk.fusion.TriangleMeshQualityOptions()
-                    mesh = mesh_mgr.createMesh(tri_opts)
+                    tri_opts = mesh_mgr.createMeshCalculator()
+                    mesh = tri_opts.calculate()
                 except:
-                    # Fallback: usar displayMeshes
                     try:
                         if mesh_mgr.displayMeshes.count > 0:
                             mesh = mesh_mgr.displayMeshes.item(0)
@@ -623,8 +960,9 @@ class RobotExporter:
                 indices = list(mesh.nodeIndices)
 
             elif is_mesh_body:
-                # MeshBody: tomamos su mesh interno
                 mb = body
+                self._log(f"[DBG][MESH] MeshBody name='{getattr(mb, 'name', '(sin nombre)')}'")
+
                 mesh = None
                 try:
                     mesh = mb.mesh
@@ -651,7 +989,7 @@ class RobotExporter:
             self._log(f"[ACDC4Robot] Error obteniendo malla: {e}")
             return [], []
 
-        # Convertimos de cm -> m (como en _matrix_to_xyz_rpy)
+        # cm -> m
         try:
             scale = self.design.unitsManager.convert(1.0, "cm", "m")
         except Exception:
@@ -664,25 +1002,153 @@ class RobotExporter:
             z = coords[i + 2] * scale
             verts_m.extend([x, y, z])
 
+        self._log(f"[DBG][MESH] vertices={len(verts_m)//3}, triangles={len(indices)//3}")
         return verts_m, indices
 
-    def _write_dae(self, filepath: str, vertices: list, indices: list):
+    def _build_brep_mesh_and_texture(self, body, occ, geom_id: str):
         """
-        Escribe un Collada 1.4.1 muy simple con una sola geometría y un solo <triangles>.
+        Malla cara por cara de un BRepBody:
+          - genera atlas PNG con un patch por cara
+          - cada cara tiene un UV (u,v) fijo (centro del patch)
+        Devuelve (vertices, indices, uvs, texture_filename)
         """
-        if not vertices or not indices:
-            self._log(f"[ACDC4Robot] _write_dae(): malla vacía, se omite {filepath}")
+        self._log(f"[ACDC4Robot] _build_brep_mesh_and_texture para '{getattr(body,'name','(sin nombre)')}'")
+
+        faces = getattr(body, "faces", None)
+        if not faces or faces.count == 0:
+            self._log("[ACDC4Robot] BRepBody sin caras, fallback basic mesh.")
+            verts, idxs = self._get_mesh_triangles_from_body_basic(body)
+            if not verts or not idxs:
+                return [], [], [], None
+
+            # UV y textura sólida
+            tex_name = geom_id + ".png"
+            tex_path = os.path.join(self.meshes_dir, tex_name)
+            color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
+            _build_solid_png(tex_path, color, size=4)
+
+            nverts = len(verts) // 3
+            uvs = [0.5, 0.5] * nverts
+            return verts, idxs, uvs, tex_name
+
+        # Colores por cara
+        face_colors = []
+        for i in range(faces.count):
+            f = faces.item(i)
+            col = self._extract_color_for_face(f, body, occ)
+            face_colors.append(col)
+
+        tex_name = geom_id + ".png"
+        tex_path = os.path.join(self.meshes_dir, tex_name)
+        w, h, uv_centers = _build_faces_atlas_png(tex_path, face_colors, cell_px=32)
+
+        if not uv_centers:
+            color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
+            _build_solid_png(tex_path, color, size=4)
+            verts, idxs = self._get_mesh_triangles_from_body_basic(body)
+            nverts = len(verts) // 3
+            uvs = [0.5, 0.5] * nverts
+            return verts, idxs, uvs, tex_name
+
+        verts_m = []
+        indices = []
+        uvs = []
+
+        try:
+            scale = self.design.unitsManager.convert(1.0, "cm", "m")
+        except Exception:
+            scale = 0.01
+
+        for i in range(faces.count):
+            f = faces.item(i)
+            uv_u, uv_v = uv_centers[i]
+
+            try:
+                mesh_mgr = f.meshManager
+                calc = mesh_mgr.createMeshCalculator()
+                mesh = calc.calculate()
+            except Exception as e:
+                self._log(f"[ACDC4Robot] Error mesh en cara {i}: {e}")
+                continue
+
+            try:
+                coords = list(mesh.nodeCoordinatesAsFloat)
+            except:
+                coords = list(mesh.nodeCoordinates)
+
+            idxs_face = list(mesh.nodeIndices)
+
+            base_index = len(verts_m) // 3
+
+            for k in range(0, len(coords), 3):
+                x = coords[k] * scale
+                y = coords[k + 1] * scale
+                z = coords[k + 2] * scale
+                verts_m.extend([x, y, z])
+                uvs.extend([uv_u, uv_v])
+
+            for idx in idxs_face:
+                indices.append(base_index + int(idx))
+
+        self._log(f"[ACDC4Robot] BRepBody triangulado cara por cara: verts={len(verts_m)//3}, tris={len(indices)//3}")
+        return verts_m, indices, uvs, tex_name
+
+    def _build_meshbody_mesh_and_texture(self, body, occ, geom_id: str):
+        """
+        MeshBody completo con una textura sólida (1 color) por .dae.
+        """
+        verts, idxs = self._get_mesh_triangles_from_body_basic(body)
+        if not verts or not idxs:
+            return [], [], [], None
+
+        tex_name = geom_id + ".png"
+        tex_path = os.path.join(self.meshes_dir, tex_name)
+
+        color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
+        _build_solid_png(tex_path, color, size=4)
+
+        nverts = len(verts) // 3
+        uvs = [0.5, 0.5] * nverts
+
+        return verts, idxs, uvs, tex_name
+
+    def _write_dae_with_texture(self, filepath: str, geom_id: str,
+                                vertices: list, indices: list,
+                                uvs: list, texture_filename: str):
+        """
+        Escribe un Collada 1.4.1 con:
+          - geometry con POSITION + TEXCOORD
+          - material con textura PNG
+        """
+        if not vertices or not indices or not uvs:
+            self._log(f"[ACDC4Robot] _write_dae_with_texture(): datos vacíos, se omite {filepath}")
             return
 
-        geom_id = os.path.splitext(os.path.basename(filepath))[0]
         pos_id = f"{geom_id}-positions"
         pos_array_id = f"{pos_id}-array"
+        tex_id = f"{geom_id}-texcoords"
+        tex_array_id = f"{tex_id}-array"
+
         verts_count = len(vertices)
         tris_count = len(indices) // 3
+        vert_count = verts_count // 3
+        uv_count = len(uvs) // 2
 
-        # Strings
+        if uv_count != vert_count:
+            self._log(f"[ACDC4Robot] WARNING: uv_count({uv_count}) != vert_count({vert_count}), ajustando...")
+            if uv_count < vert_count:
+                if uv_count == 0:
+                    uvs = [0.5, 0.5] * vert_count
+                else:
+                    last_u, last_v = uvs[-2], uvs[-1]
+                    missing = vert_count - uv_count
+                    uvs.extend([last_u, last_v] * missing)
+            else:
+                uvs = uvs[:vert_count * 2]
+
         verts_str = " ".join(f"{v:.9g}" for v in vertices)
         indices_str = " ".join(str(int(i)) for i in indices)
+        uvs_str = " ".join(f"{c:.6f}" for c in uvs)
 
         dae = f"""<?xml version="1.0" encoding="utf-8"?>
 <COLLADA xmlns="http://www.collada.org/2005/11/COLLADASchema" version="1.4.1">
@@ -694,16 +1160,62 @@ class RobotExporter:
     <up_axis>Z_UP</up_axis>
   </asset>
 
+  <library_images>
+    <image id="{geom_id}-image" name="{geom_id}-image">
+      <init_from>{texture_filename}</init_from>
+    </image>
+  </library_images>
+
+  <library_effects>
+    <effect id="mat-effect">
+      <profile_COMMON>
+        <newparam sid="surface0">
+          <surface type="2D">
+            <init_from>{geom_id}-image</init_from>
+          </surface>
+        </newparam>
+        <newparam sid="sampler0">
+          <sampler2D>
+            <source>surface0</source>
+          </sampler2D>
+        </newparam>
+        <technique sid="common">
+          <phong>
+            <diffuse>
+              <texture texture="sampler0" texcoord="TEX0"/>
+            </diffuse>
+          </phong>
+        </technique>
+      </profile_COMMON>
+    </effect>
+  </library_effects>
+
+  <library_materials>
+    <material id="mat" name="mat">
+      <instance_effect url="#mat-effect"/>
+    </material>
+  </library_materials>
+
   <library_geometries>
     <geometry id="{geom_id}" name="{geom_id}">
       <mesh>
         <source id="{pos_id}">
           <float_array id="{pos_array_id}" count="{verts_count}">{verts_str}</float_array>
           <technique_common>
-            <accessor source="#{pos_array_id}" count="{verts_count // 3}" stride="3">
+            <accessor source="#{pos_array_id}" count="{vert_count}" stride="3">
               <param name="X" type="float"/>
               <param name="Y" type="float"/>
               <param name="Z" type="float"/>
+            </accessor>
+          </technique_common>
+        </source>
+
+        <source id="{tex_id}">
+          <float_array id="{tex_array_id}" count="{2*vert_count}">{uvs_str}</float_array>
+          <technique_common>
+            <accessor source="#{tex_array_id}" count="{vert_count}" stride="2">
+              <param name="S" type="float"/>
+              <param name="T" type="float"/>
             </accessor>
           </technique_common>
         </source>
@@ -712,8 +1224,9 @@ class RobotExporter:
           <input semantic="POSITION" source="#{pos_id}"/>
         </vertices>
 
-        <triangles count="{tris_count}">
+        <triangles count="{tris_count}" material="mat">
           <input semantic="VERTEX" source="#{geom_id}-vertices" offset="0"/>
+          <input semantic="TEXCOORD" source="#{tex_id}" offset="0" set="0"/>
           <p>{indices_str}</p>
         </triangles>
       </mesh>
@@ -723,7 +1236,15 @@ class RobotExporter:
   <library_visual_scenes>
     <visual_scene id="Scene" name="Scene">
       <node id="{geom_id}-node" name="{geom_id}">
-        <instance_geometry url="#{geom_id}"/>
+        <instance_geometry url="#{geom_id}">
+          <bind_material>
+            <technique_common>
+              <instance_material symbol="mat" target="#mat">
+                <bind_vertex_input semantic="TEX0" input_semantic="TEXCOORD" input_set="0"/>
+              </instance_material>
+            </technique_common>
+          </bind_material>
+        </instance_geometry>
       </node>
     </visual_scene>
   </library_visual_scenes>
@@ -736,16 +1257,15 @@ class RobotExporter:
         try:
             with open(filepath, "w", encoding="utf-8") as f:
                 f.write(dae)
-            self._log(f"[ACDC4Robot] DAE generado: {filepath}")
+            self._log(f"[ACDC4Robot] DAE generado: {filepath} (tex='{texture_filename}')")
         except Exception as e:
             self._log(f"[ACDC4Robot] Error escribiendo DAE '{filepath}': {e}")
 
     def _export_dae_meshes(self):
         """
-        Reemplaza el antiguo _export_meshes() que usaba exportManager a STL.
-        Ahora:
-          - extrae la malla de cada BRepBody/MeshBody
-          - la escribe como .dae
+        - Para BRepBody: atlas de textura PNG por cara.
+        - Para MeshBody: textura sólida por .dae.
+        En todos los casos: 1 .png por .dae en la misma carpeta.
         """
         for link in self.links:
             mesh_name = link.get("mesh")
@@ -755,19 +1275,38 @@ class RobotExporter:
             item = link.get("item")
             occ = link.get("occ")
 
-            # Solo usamos 'item' (BRepBody o MeshBody); si no hay, intentamos occ
             export_target = item if item is not None else occ
             if export_target is None:
                 continue
 
             dae_path = os.path.join(self.meshes_dir, mesh_name)
+            geom_id = os.path.splitext(mesh_name)[0]
 
             try:
-                verts, idxs = self._get_mesh_triangles_from_body(export_target)
-                if not verts or not idxs:
-                    self._log(f"[ACDC4Robot] Sin malla para {link.get('name', '?')}, DAE omitido.")
+                is_brep = hasattr(item, "faces") and hasattr(item, "meshManager")
+                is_mesh_body = hasattr(item, "mesh") or hasattr(item, "displayMesh")
+
+                if is_brep:
+                    verts, idxs, uvs, tex_name = self._build_brep_mesh_and_texture(item, occ, geom_id)
+                elif is_mesh_body:
+                    verts, idxs, uvs, tex_name = self._build_meshbody_mesh_and_texture(item, occ, geom_id)
+                else:
+                    verts, idxs = self._get_mesh_triangles_from_body_basic(export_target)
+                    if not verts or not idxs:
+                        self._log(f"[ACDC4Robot] Sin malla para {link.get('name','?')}, DAE omitido.")
+                        continue
+                    tex_name = geom_id + ".png"
+                    tex_path = os.path.join(self.meshes_dir, tex_name)
+                    color = self._extract_color_for_link(item, occ) or (0.7, 0.7, 0.7, 1.0)
+                    _build_solid_png(tex_path, color, size=4)
+                    nverts = len(verts) // 3
+                    uvs = [0.5, 0.5] * nverts
+
+                if not verts or not idxs or not uvs or not tex_name:
+                    self._log(f"[ACDC4Robot] Datos insuficientes para link '{link.get('name','?')}', DAE omitido.")
                     continue
-                self._write_dae(dae_path, verts, idxs)
+
+                self._write_dae_with_texture(dae_path, geom_id, verts, idxs, uvs, tex_name)
             except Exception:
                 self._log(
                     f"[ACDC4Robot] Error exportando DAE para {link.get('name', '?')}:\n"
@@ -800,7 +1339,6 @@ class RobotExporter:
             if mesh:
                 lines.append('    <visual>')
                 lines.append('      <origin xyz="0 0 0" rpy="0 0 0"/>')
-                # AHORA el .dae ya viene en metros => scale=1
                 lines.append(
                     f'      <geometry><mesh filename="meshes/{mesh}" '
                     f'scale="1 1 1"/></geometry>'
