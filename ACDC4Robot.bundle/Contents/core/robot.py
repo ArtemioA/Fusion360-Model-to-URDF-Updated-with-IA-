@@ -352,10 +352,11 @@ class RobotExporter:
             return "medium"
         q = label.strip().lower()
 
-        # >>> VLO: modo ultra optimizado por velocidad
-        if "very" in q and "low" in q and "optimized" in q:
+        # NUEVO: modo ultra optimizado
+        if "very low quality optimized" in q:
             return "very_low_optimized"
 
+        # soportar "very low quality"
         if "very" in q and "low" in q:
             return "very_low"
         if "low" in q:
@@ -1001,7 +1002,7 @@ class RobotExporter:
         NO maneja UV ni textura, se usa como fallback.
 
         - Para BRep usamos TriangleMeshCalculator con calidad configurable
-          (very_low_optimized / very_low / low / medium / high).
+          (very_low / low / medium / high).
         - Siempre trabajamos en el cuerpo nativo del componente para evitar errores de posición.
         """
         body = self._get_body_in_component_space(body)
@@ -1025,29 +1026,27 @@ class RobotExporter:
                     try:
                         from adsk.fusion import TriangleMeshQualityOptions
                         mode = self.mesh_quality_mode
+                        # Para el mesh básico tratamos very_low_optimized igual que very_low
+                        if mode == "very_low_optimized":
+                            mode_effective = "very_low"
+                        else:
+                            mode_effective = mode
 
                         # intentamos varios nombres por modo, para ser robustos
                         candidates = []
-                        if mode == "very_low_optimized":
-                            # >>> VLO: lo más burdo posible
+                        if mode_effective == "very_low":
                             candidates = [
                                 "VeryCoarseTriangleMesh",
                                 "CoarseTriangleMesh",
                                 "LowQualityTriangleMesh",
                             ]
-                        elif mode == "very_low":
-                            candidates = [
-                                "VeryCoarseTriangleMesh",
-                                "CoarseTriangleMesh",
-                                "LowQualityTriangleMesh",
-                            ]
-                        elif mode == "low":
+                        elif mode_effective == "low":
                             candidates = [
                                 "LowQualityTriangleMesh",
                                 "CoarseTriangleMesh",
                                 "MediumQualityTriangleMesh",
                             ]
-                        elif mode == "high":
+                        elif mode_effective == "high":
                             candidates = [
                                 "VeryFineTriangleMesh",
                                 "FineTriangleMesh",
@@ -1085,35 +1084,36 @@ class RobotExporter:
                         diameter = math.sqrt(dx*dx + dy*dy + dz*dz) if bbox else 1.0
 
                         mode = self.mesh_quality_mode
-                        # exponente: más grande ⇒ más fino
+                        # Para tolerancia también tratamos very_low_optimized como very_low
                         if mode == "very_low_optimized":
-                            # >>> VLO: tolerancia muy gruesa
-                            pow_ = 4
-                        elif mode == "very_low":
+                            mode_effective = "very_low"
+                        else:
+                            mode_effective = mode
+
+                        # exponente: más grande ⇒ más fino
+                        if mode_effective == "very_low":
                             pow_ = 6
-                        elif mode == "low":
+                        elif mode_effective == "low":
                             pow_ = 8
-                        elif mode == "high":
+                        elif mode_effective == "high":
                             pow_ = 12
                         else:  # medium
                             pow_ = 10
 
                         try:
                             calc.surfaceTolerance = diameter / (2.0 ** pow_)
-                            self._log(f"[DBG][MESH] surfaceTolerance={calc.surfaceTolerance} (mode={mode})")
+                            self._log(f"[DBG][MESH] surfaceTolerance={calc.surfaceTolerance} (mode={mode_effective})")
                         except Exception:
                             # fallback absoluto
-                            if mode == "very_low_optimized":
-                                calc.surfaceTolerance = 1.0
-                            elif mode == "very_low":
+                            if mode_effective == "very_low":
                                 calc.surfaceTolerance = 0.5
-                            elif mode == "low":
+                            elif mode_effective == "low":
                                 calc.surfaceTolerance = 0.25
-                            elif mode == "high":
+                            elif mode_effective == "high":
                                 calc.surfaceTolerance = 0.02
                             else:
                                 calc.surfaceTolerance = 0.1
-                            self._log(f"[DBG][MESH] surfaceTolerance fallback={calc.surfaceTolerance} (mode={mode})")
+                            self._log(f"[DBG][MESH] surfaceTolerance fallback={calc.surfaceTolerance} (mode={mode_effective})")
 
                     mesh = calc.calculate()
                 except:
@@ -1186,20 +1186,17 @@ class RobotExporter:
         Malla cara por cara de un BRepBody:
           - genera atlas PNG con un patch por cara
           - cada cara tiene un UV (u,v) fijo (centro del patch)
-
-        EXCEPCIÓN:
-          - Si mesh_quality_mode == "very_low_optimized":
-              * NO se triangula cara por cara
-              * Se usa una única malla básica por cuerpo
-              * Textura sólida 1 color por cuerpo
-              * Muchísimo más rápido para ensamblajes grandes.
         Devuelve (vertices, indices, uvs, texture_filename)
+
+        Calidad también depende de self.mesh_quality_mode.
         """
         body = self._get_body_in_component_space(body)
 
-        # >>> VLO: camino ultra rápido, sacrificando colores por cara
+        self._log(f"[ACDC4Robot] _build_brep_mesh_and_texture para '{getattr(body,'name','(sin nombre)')}'")
+
+        # NUEVO: modo ultra rápido → no triangulamos cara por cara
         if self.mesh_quality_mode == "very_low_optimized":
-            self._log(f"[ACDC4Robot] Very Low Quality Optimized: usando malla básica por cuerpo para '{getattr(body,'name','(sin nombre)')}'")
+            self._log("[ACDC4Robot] Modo 'Very Low Quality Optimized': usando malla básica por cuerpo (sin atlas por cara).")
             verts, idxs = self._get_mesh_triangles_from_body_basic(body)
             if not verts or not idxs:
                 return [], [], [], None
@@ -1207,15 +1204,11 @@ class RobotExporter:
             tex_name = geom_id + ".png"
             tex_path = os.path.join(self.meshes_dir, tex_name)
             color = self._extract_color_for_link(body, occ) or (0.7, 0.7, 0.7, 1.0)
-            # textura mínima (2x2) para reducir aún más coste
-            _build_solid_png(tex_path, color, size=2)
+            _build_solid_png(tex_path, color, size=4)
 
             nverts = len(verts) // 3
             uvs = [0.5, 0.5] * nverts
             return verts, idxs, uvs, tex_name
-
-        # --- Camino normal (con atlas por cara) ---
-        self._log(f"[ACDC4Robot] _build_brep_mesh_and_texture para '{getattr(body,'name','(sin nombre)')}'")
 
         faces = getattr(body, "faces", None)
         if not faces or faces.count == 0:
@@ -1277,21 +1270,26 @@ class RobotExporter:
                 try:
                     from adsk.fusion import TriangleMeshQualityOptions
                     mode = self.mesh_quality_mode
+                    # very_low_optimized se comporta como very_low en la triangulación por cara
+                    if mode == "very_low_optimized":
+                        mode_effective = "very_low"
+                    else:
+                        mode_effective = mode
 
                     candidates = []
-                    if mode == "very_low":
+                    if mode_effective == "very_low":
                         candidates = [
                             "VeryCoarseTriangleMesh",
                             "CoarseTriangleMesh",
                             "LowQualityTriangleMesh",
                         ]
-                    elif mode == "low":
+                    elif mode_effective == "low":
                         candidates = [
                             "LowQualityTriangleMesh",
                             "CoarseTriangleMesh",
                             "MediumQualityTriangleMesh",
                         ]
-                    elif mode == "high":
+                    elif mode_effective == "high":
                         candidates = [
                             "VeryFineTriangleMesh",
                             "FineTriangleMesh",
@@ -1327,28 +1325,33 @@ class RobotExporter:
                     diameter = math.sqrt(dx*dx + dy*dy + dz*dz) if bbox else 1.0
 
                     mode = self.mesh_quality_mode
-                    if mode == "very_low":
+                    if mode == "very_low_optimized":
+                        mode_effective = "very_low"
+                    else:
+                        mode_effective = mode
+
+                    if mode_effective == "very_low":
                         pow_ = 6
-                    elif mode == "low":
+                    elif mode_effective == "low":
                         pow_ = 8
-                    elif mode == "high":
+                    elif mode_effective == "high":
                         pow_ = 12
                     else:
                         pow_ = 10
 
                     try:
                         calc.surfaceTolerance = diameter / (2.0 ** pow_)
-                        self._log(f"[DBG][MESH_FACE] surfaceTolerance={calc.surfaceTolerance} (mode={mode}, cara={i})")
+                        self._log(f"[DBG][MESH_FACE] surfaceTolerance={calc.surfaceTolerance} (mode={mode_effective}, cara={i})")
                     except Exception:
-                        if mode == "very_low":
+                        if mode_effective == "very_low":
                             calc.surfaceTolerance = 0.5
-                        elif mode == "low":
+                        elif mode_effective == "low":
                             calc.surfaceTolerance = 0.25
-                        elif mode == "high":
+                        elif mode_effective == "high":
                             calc.surfaceTolerance = 0.02
                         else:
                             calc.surfaceTolerance = 0.1
-                        self._log(f"[DBG][MESH_FACE] surfaceTolerance fallback={calc.surfaceTolerance} (mode={mode}, cara={i})")
+                        self._log(f"[DBG][MESH_FACE] surfaceTolerance fallback={calc.surfaceTolerance} (mode={mode_effective}, cara={i})")
 
                 mesh = calc.calculate()
                 if not mesh:
@@ -1569,8 +1572,7 @@ class RobotExporter:
 
     def _export_dae_meshes(self):
         """
-        - Para BRepBody: atlas de textura PNG por cara
-          (salvo en modo Very Low Quality Optimized, donde se usa malla básica).
+        - Para BRepBody: atlas de textura PNG por cara.
         - Para MeshBody: textura sólida por .dae.
         En todos los casos: 1 .png por .dae en la misma carpeta.
 
@@ -1736,11 +1738,8 @@ def export_robot(
     export_robot(robot_name, base_output_dir, mesh_quality)
 
     - mesh_quality: string como
-        "Very Low Quality Optimized"  -> ultra rápido, 1 color por cuerpo
-        "Very low quality"
-        "Low quality"
-        "Medium quality"
-        "Hight quality" / "High quality"
+      "Very Low Quality Optimized", "Very low quality",
+      "Low quality", "Medium quality", "Hight quality".
       Si es None → medium.
     """
     # Compatibilidad con llamadas antiguas muy raras
