@@ -313,8 +313,10 @@ class RobotExporter:
 
         self.robot_name = _sanitize(robot_name) or "acdc_robot"
 
-        # --- NUEVO: calidad de malla ---
-        self.mesh_quality_label = mesh_quality if isinstance(mesh_quality, str) else "Medium quality"
+        # --- SOLO DOS OPCIONES EXTERNAS ---
+        # "Low Quality"  -> very_low_optimized (rápido)
+        # "High Quality" -> display_mesh (usa displayMeshes cuando pueda)
+        self.mesh_quality_label = mesh_quality if isinstance(mesh_quality, str) else "Low Quality"
         self.mesh_quality_mode = self._normalize_mesh_quality(self.mesh_quality_label)
         self._log(f"[ACDC4Robot] Mesh quality = '{self.mesh_quality_label}' → mode='{self.mesh_quality_mode}'")
 
@@ -334,36 +336,45 @@ class RobotExporter:
         self.single_link_no_joints = False
 
     # ------------------------------
-    # NUEVO: normalizar calidad
+    # NORMALIZAR CALIDAD (SOLO 2 OPCIONES EXTERNAS)
     # ------------------------------
 
     def _normalize_mesh_quality(self, label: str) -> str:
         """
         Convierte el texto del UI a un modo interno:
-          very_low_optimized / very_low / low / medium / high
-        Acepta:
-          - "Very Low Quality Optimized"
-          - "Very low quality"
-          - "Low quality"
-          - "Medium quality"
-          - "Hight quality" (sic) / "High quality"
+          - "Low Quality"  -> "very_low_optimized"
+          - "High Quality" -> "display_mesh"
+
+        Mantiene soporte parcial a nombres antiguos por compatibilidad.
         """
         if not label:
-            return "medium"
+            return "very_low_optimized"
+
         q = label.strip().lower()
 
-        # NUEVO: modo ultra optimizado
+        # NUEVOS NOMBRES DEL UI
+        if q == "low quality":
+            return "very_low_optimized"
+        if q == "high quality":
+            return "display_mesh"
+
+        # Compatibilidad con nombres antiguos
         if "very low quality optimized" in q:
             return "very_low_optimized"
 
-        # soportar "very low quality"
+        if "display" in q and "mesh" in q:
+            return "display_mesh"
+
         if "very" in q and "low" in q:
             return "very_low"
         if "low" in q:
             return "low"
         if "hight" in q or "high" in q:
-            return "high"
-        return "medium"
+            # Si viene un "High quality" viejo, lo tratamos como display_mesh
+            return "display_mesh"
+
+        # Por defecto, algo decente
+        return "very_low_optimized"
 
     # ------------------------------
 
@@ -1001,14 +1012,15 @@ class RobotExporter:
         Versión básica: devuelve (vertices_m, indices) para un BRepBody o MeshBody.
         NO maneja UV ni textura, se usa como fallback.
 
-        - Para BRep usamos TriangleMeshCalculator con calidad configurable
-          (very_low / low / medium / high).
+        - Para BRep usamos:
+            * Si mesh_quality_mode == "display_mesh": displayMeshes si existen
+            * En otros casos: TriangleMeshCalculator con calidad configurable
         - Siempre trabajamos en el cuerpo nativo del componente para evitar errores de posición.
         """
         body = self._get_body_in_component_space(body)
 
         is_brep = hasattr(body, "meshManager")
-        is_mesh_body = hasattr(body, "mesh")
+        is_mesh_body = hasattr(body, "mesh") or hasattr(body, "displayMesh")
 
         coords = []
         indices = []
@@ -1019,111 +1031,126 @@ class RobotExporter:
 
                 mesh_mgr = body.meshManager
                 mesh = None
-                try:
-                    calc = mesh_mgr.createMeshCalculator()
 
-                    # --- NUEVO: calidad según self.mesh_quality_mode ---
+                # PRIMERO: si estamos en modo display_mesh, intentamos usar displayMeshes
+                if self.mesh_quality_mode == "display_mesh":
                     try:
-                        from adsk.fusion import TriangleMeshQualityOptions
-                        mode = self.mesh_quality_mode
-                        # Para el mesh básico tratamos very_low_optimized igual que very_low
-                        if mode == "very_low_optimized":
-                            mode_effective = "very_low"
-                        else:
-                            mode_effective = mode
+                        dm = getattr(mesh_mgr, "displayMeshes", None)
+                        if dm and dm.count > 0:
+                            mesh = dm.item(0)
+                            self._log("[DBG][MESH] displayMeshes usado (modo display_mesh).")
+                    except Exception as e:
+                        self._log(f"[DBG][MESH] Error usando displayMeshes: {e}")
 
-                        # intentamos varios nombres por modo, para ser robustos
-                        candidates = []
-                        if mode_effective == "very_low":
-                            candidates = [
-                                "VeryCoarseTriangleMesh",
-                                "CoarseTriangleMesh",
-                                "LowQualityTriangleMesh",
-                            ]
-                        elif mode_effective == "low":
-                            candidates = [
-                                "LowQualityTriangleMesh",
-                                "CoarseTriangleMesh",
-                                "MediumQualityTriangleMesh",
-                            ]
-                        elif mode_effective == "high":
-                            candidates = [
-                                "VeryFineTriangleMesh",
-                                "FineTriangleMesh",
-                                "HighQualityTriangleMesh",
-                            ]
-                        else:  # medium
-                            candidates = ["MediumQualityTriangleMesh"]
+                # Si no hay displayMesh o no estamos en display_mesh, usamos TriangleMeshCalculator
+                if mesh is None:
+                    try:
+                        calc = mesh_mgr.createMeshCalculator()
 
-                        chosen = None
-                        for name in candidates:
-                            if hasattr(TriangleMeshQualityOptions, name):
-                                opt = getattr(TriangleMeshQualityOptions, name)
-                                calc.setQuality(opt)
-                                chosen = name
-                                break
-
-                        # fallback a Medium si nada anterior existe
-                        if chosen is None and hasattr(TriangleMeshQualityOptions, "MediumQualityTriangleMesh"):
-                            opt = getattr(TriangleMeshQualityOptions, "MediumQualityTriangleMesh")
-                            calc.setQuality(opt)
-                            chosen = "MediumQualityTriangleMesh"
-
-                        self._log(f"[DBG][MESH] TriangleMeshCalculator.setQuality({chosen})")
-                    except Exception:
-                        # Fallback: ajustar tolerancia manualmente según calidad
+                        # --- calidad según self.mesh_quality_mode ---
                         try:
-                            bbox = body.boundingBox
-                            dx = bbox.maxPoint.x - bbox.minPoint.x
-                            dy = bbox.maxPoint.y - bbox.minPoint.y
-                            dz = bbox.maxPoint.z - bbox.maxPoint.z
-                        except Exception:
-                            bbox = None
-                            dx = dy = dz = 1.0
+                            from adsk.fusion import TriangleMeshQualityOptions
+                            mode = self.mesh_quality_mode
 
-                        diameter = math.sqrt(dx*dx + dy*dy + dz*dz) if bbox else 1.0
-
-                        mode = self.mesh_quality_mode
-                        # Para tolerancia también tratamos very_low_optimized como very_low
-                        if mode == "very_low_optimized":
-                            mode_effective = "very_low"
-                        else:
-                            mode_effective = mode
-
-                        # exponente: más grande ⇒ más fino
-                        if mode_effective == "very_low":
-                            pow_ = 6
-                        elif mode_effective == "low":
-                            pow_ = 8
-                        elif mode_effective == "high":
-                            pow_ = 12
-                        else:  # medium
-                            pow_ = 10
-
-                        try:
-                            calc.surfaceTolerance = diameter / (2.0 ** pow_)
-                            self._log(f"[DBG][MESH] surfaceTolerance={calc.surfaceTolerance} (mode={mode_effective})")
-                        except Exception:
-                            # fallback absoluto
-                            if mode_effective == "very_low":
-                                calc.surfaceTolerance = 0.5
-                            elif mode_effective == "low":
-                                calc.surfaceTolerance = 0.25
-                            elif mode_effective == "high":
-                                calc.surfaceTolerance = 0.02
+                            # very_low_optimized -> muy burdo
+                            if mode == "very_low_optimized":
+                                mode_effective = "very_low"
+                            # display_mesh -> algo equivalente a alta calidad si hay que caer al calculador
+                            elif mode == "display_mesh":
+                                mode_effective = "high"
                             else:
-                                calc.surfaceTolerance = 0.1
-                            self._log(f"[DBG][MESH] surfaceTolerance fallback={calc.surfaceTolerance} (mode={mode_effective})")
+                                mode_effective = mode
 
-                    mesh = calc.calculate()
-                except:
-                    # fallback: displayMeshes
-                    try:
-                        if mesh_mgr.displayMeshes.count > 0:
-                            mesh = mesh_mgr.displayMeshes.item(0)
-                            self._log("[DBG][MESH] Usando displayMeshes como fallback.")
+                            candidates = []
+                            if mode_effective == "very_low":
+                                candidates = [
+                                    "VeryCoarseTriangleMesh",
+                                    "CoarseTriangleMesh",
+                                    "LowQualityTriangleMesh",
+                                ]
+                            elif mode_effective == "low":
+                                candidates = [
+                                    "LowQualityTriangleMesh",
+                                    "CoarseTriangleMesh",
+                                    "MediumQualityTriangleMesh",
+                                ]
+                            elif mode_effective == "high":
+                                candidates = [
+                                    "VeryFineTriangleMesh",
+                                    "FineTriangleMesh",
+                                    "HighQualityTriangleMesh",
+                                ]
+                            else:  # medium
+                                candidates = ["MediumQualityTriangleMesh"]
+
+                            chosen = None
+                            for name in candidates:
+                                if hasattr(TriangleMeshQualityOptions, name):
+                                    opt = getattr(TriangleMeshQualityOptions, name)
+                                    calc.setQuality(opt)
+                                    chosen = name
+                                    break
+
+                            if chosen is None and hasattr(TriangleMeshQualityOptions, "MediumQualityTriangleMesh"):
+                                opt = getattr(TriangleMeshQualityOptions, "MediumQualityTriangleMesh")
+                                calc.setQuality(opt)
+                                chosen = "MediumQualityTriangleMesh"
+
+                            self._log(f"[DBG][MESH] TriangleMeshCalculator.setQuality({chosen})")
+                        except Exception:
+                            # Fallback: ajustar tolerancia manualmente según calidad
+                            try:
+                                bbox = body.boundingBox
+                                dx = bbox.maxPoint.x - bbox.minPoint.x
+                                dy = bbox.maxPoint.y - bbox.minPoint.y
+                                dz = bbox.maxPoint.z - bbox.maxPoint.z
+                            except Exception:
+                                bbox = None
+                                dx = dy = dz = 1.0
+
+                            diameter = math.sqrt(dx*dx + dy*dy + dz*dz) if bbox else 1.0
+
+                            mode = self.mesh_quality_mode
+                            if mode == "very_low_optimized":
+                                mode_effective = "very_low"
+                            elif mode == "display_mesh":
+                                mode_effective = "high"
+                            else:
+                                mode_effective = mode
+
+                            if mode_effective == "very_low":
+                                pow_ = 6
+                            elif mode_effective == "low":
+                                pow_ = 8
+                            elif mode_effective == "high":
+                                pow_ = 12
+                            else:  # medium
+                                pow_ = 10
+
+                            try:
+                                calc.surfaceTolerance = diameter / (2.0 ** pow_)
+                                self._log(f"[DBG][MESH] surfaceTolerance={calc.surfaceTolerance} (mode={mode_effective})")
+                            except Exception:
+                                if mode_effective == "very_low":
+                                    calc.surfaceTolerance = 0.5
+                                elif mode_effective == "low":
+                                    calc.surfaceTolerance = 0.25
+                                elif mode_effective == "high":
+                                    calc.surfaceTolerance = 0.02
+                                else:
+                                    calc.surfaceTolerance = 0.1
+                                self._log(f"[DBG][MESH] surfaceTolerance fallback={calc.surfaceTolerance} (mode={mode_effective})")
+
+                        mesh = calc.calculate()
                     except:
-                        pass
+                        # fallback: displayMeshes (para otros modos)
+                        try:
+                            dm = getattr(mesh_mgr, "displayMeshes", None)
+                            if dm and dm.count > 0:
+                                mesh = dm.item(0)
+                                self._log("[DBG][MESH] Usando displayMeshes como fallback.")
+                        except:
+                            pass
 
                 if not mesh:
                     raise RuntimeError("No se pudo obtener el mesh del BRepBody.")
@@ -1140,13 +1167,25 @@ class RobotExporter:
                 self._log(f"[DBG][MESH] MeshBody name='{getattr(mb, 'name', '(sin nombre)')}'")
 
                 mesh = None
-                try:
-                    mesh = mb.mesh
-                except:
+
+                # Para MeshBody en modo display_mesh, intentamos displayMesh primero
+                if self.mesh_quality_mode == "display_mesh":
                     try:
-                        mesh = mb.displayMesh
+                        dm = getattr(mb, "displayMesh", None)
+                        if dm:
+                            mesh = dm
+                            self._log("[DBG][MESH] MeshBody.displayMesh usado (modo display_mesh).")
+                    except Exception as e:
+                        self._log(f"[DBG][MESH] Error usando MeshBody.displayMesh: {e}")
+
+                if mesh is None:
+                    try:
+                        mesh = mb.mesh
                     except:
-                        pass
+                        try:
+                            mesh = mb.displayMesh
+                        except:
+                            pass
 
                 if not mesh:
                     raise RuntimeError("No se pudo obtener el mesh de MeshBody.")
@@ -1183,20 +1222,30 @@ class RobotExporter:
 
     def _build_brep_mesh_and_texture(self, body, occ, geom_id: str):
         """
-        Malla cara por cara de un BRepBody:
-          - genera atlas PNG con un patch por cara
-          - cada cara tiene un UV (u,v) fijo (centro del patch)
-        Devuelve (vertices, indices, uvs, texture_filename)
+        Malla cara por cara de un BRepBody O simplificada según modo:
 
-        Calidad también depende de self.mesh_quality_mode.
+        - Modo "very_low_optimized":
+            * malla básica por cuerpo (rápida, pocos nodos)
+            * textura sólida pequeña (un color)
+        - Modo "display_mesh":
+            * malla básica por cuerpo usando displayMeshes si es posible
+            * textura sólida pequeña (un color)
+
+        Otros modos (no usados desde el UI actual) podrían usar el
+        camino cara-por-cara con atlas, pero aquí solo manejamos
+        los dos modos expuestos.
         """
         body = self._get_body_in_component_space(body)
 
         self._log(f"[ACDC4Robot] _build_brep_mesh_and_texture para '{getattr(body,'name','(sin nombre)')}'")
 
-        # NUEVO: modo ultra rápido → no triangulamos cara por cara
-        if self.mesh_quality_mode == "very_low_optimized":
-            self._log("[ACDC4Robot] Modo 'Very Low Quality Optimized': usando malla básica por cuerpo (sin atlas por cara).")
+        # NUEVO: ambos modos externos usan la malla básica por cuerpo
+        if self.mesh_quality_mode in ("very_low_optimized", "display_mesh"):
+            if self.mesh_quality_mode == "very_low_optimized":
+                self._log("[ACDC4Robot] Modo 'Very Low Quality Optimized': malla básica muy burda por cuerpo.")
+            else:
+                self._log("[ACDC4Robot] Modo 'High Quality (Display Mesh)': malla básica usando displayMeshes si están disponibles.")
+
             verts, idxs = self._get_mesh_triangles_from_body_basic(body)
             if not verts or not idxs:
                 return [], [], [], None
@@ -1209,6 +1258,8 @@ class RobotExporter:
             nverts = len(verts) // 3
             uvs = [0.5, 0.5] * nverts
             return verts, idxs, uvs, tex_name
+
+        # --- CAMINO ANTIGUO (no usado con las 2 opciones nuevas, se deja por compat) ---
 
         faces = getattr(body, "faces", None)
         if not faces or faces.count == 0:
@@ -1266,38 +1317,10 @@ class RobotExporter:
                 mesh_mgr = f.meshManager
                 calc = mesh_mgr.createMeshCalculator()
 
-                # --- NUEVO: calidad según modo ---
+                # Calidad estándar para este camino (medium)
                 try:
                     from adsk.fusion import TriangleMeshQualityOptions
-                    mode = self.mesh_quality_mode
-                    # very_low_optimized se comporta como very_low en la triangulación por cara
-                    if mode == "very_low_optimized":
-                        mode_effective = "very_low"
-                    else:
-                        mode_effective = mode
-
-                    candidates = []
-                    if mode_effective == "very_low":
-                        candidates = [
-                            "VeryCoarseTriangleMesh",
-                            "CoarseTriangleMesh",
-                            "LowQualityTriangleMesh",
-                        ]
-                    elif mode_effective == "low":
-                        candidates = [
-                            "LowQualityTriangleMesh",
-                            "CoarseTriangleMesh",
-                            "MediumQualityTriangleMesh",
-                        ]
-                    elif mode_effective == "high":
-                        candidates = [
-                            "VeryFineTriangleMesh",
-                            "FineTriangleMesh",
-                            "HighQualityTriangleMesh",
-                        ]
-                    else:  # medium
-                        candidates = ["MediumQualityTriangleMesh"]
-
+                    candidates = ["MediumQualityTriangleMesh"]
                     chosen = None
                     for name in candidates:
                         if hasattr(TriangleMeshQualityOptions, name):
@@ -1305,12 +1328,6 @@ class RobotExporter:
                             calc.setQuality(opt)
                             chosen = name
                             break
-
-                    if chosen is None and hasattr(TriangleMeshQualityOptions, "MediumQualityTriangleMesh"):
-                        opt = getattr(TriangleMeshQualityOptions, "MediumQualityTriangleMesh")
-                        calc.setQuality(opt)
-                        chosen = "MediumQualityTriangleMesh"
-
                     self._log(f"[DBG][MESH_FACE] setQuality({chosen}) para cara {i}")
                 except Exception:
                     try:
@@ -1324,34 +1341,13 @@ class RobotExporter:
 
                     diameter = math.sqrt(dx*dx + dy*dy + dz*dz) if bbox else 1.0
 
-                    mode = self.mesh_quality_mode
-                    if mode == "very_low_optimized":
-                        mode_effective = "very_low"
-                    else:
-                        mode_effective = mode
-
-                    if mode_effective == "very_low":
-                        pow_ = 6
-                    elif mode_effective == "low":
-                        pow_ = 8
-                    elif mode_effective == "high":
-                        pow_ = 12
-                    else:
-                        pow_ = 10
-
+                    pow_ = 10
                     try:
                         calc.surfaceTolerance = diameter / (2.0 ** pow_)
-                        self._log(f"[DBG][MESH_FACE] surfaceTolerance={calc.surfaceTolerance} (mode={mode_effective}, cara={i})")
+                        self._log(f"[DBG][MESH_FACE] surfaceTolerance={calc.surfaceTolerance} (cara={i})")
                     except Exception:
-                        if mode_effective == "very_low":
-                            calc.surfaceTolerance = 0.5
-                        elif mode_effective == "low":
-                            calc.surfaceTolerance = 0.25
-                        elif mode_effective == "high":
-                            calc.surfaceTolerance = 0.02
-                        else:
-                            calc.surfaceTolerance = 0.1
-                        self._log(f"[DBG][MESH_FACE] surfaceTolerance fallback={calc.surfaceTolerance} (mode={mode_effective}, cara={i})")
+                        calc.surfaceTolerance = 0.1
+                        self._log(f"[DBG][MESH_FACE] surfaceTolerance fallback={calc.surfaceTolerance} (cara={i})")
 
                 mesh = calc.calculate()
                 if not mesh:
@@ -1572,7 +1568,7 @@ class RobotExporter:
 
     def _export_dae_meshes(self):
         """
-        - Para BRepBody: atlas de textura PNG por cara.
+        - Para BRepBody: malla por cuerpo (modo low/high) con textura PNG sólida.
         - Para MeshBody: textura sólida por .dae.
         En todos los casos: 1 .png por .dae en la misma carpeta.
 
@@ -1737,10 +1733,9 @@ def export_robot(
     """
     export_robot(robot_name, base_output_dir, mesh_quality)
 
-    - mesh_quality: string como
-      "Very Low Quality Optimized", "Very low quality",
-      "Low quality", "Medium quality", "Hight quality".
-      Si es None → medium.
+    - mesh_quality (UI):
+        "Low Quality"  -> Very Low Quality Optimized (muy rápido)
+        "High Quality" -> Display Mesh (usa displayMeshes si es posible)
     """
     # Compatibilidad con llamadas antiguas muy raras
     if robot_name is None and args:
