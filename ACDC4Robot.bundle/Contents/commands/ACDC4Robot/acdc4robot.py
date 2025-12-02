@@ -57,7 +57,7 @@ def on_input_changed(args):
 # EJECUCIÓN REAL DEL EXPORTADOR
 # =========================================================
 
-def run_export(robot_name, output_folder, mesh_quality="Medium"):
+def run_export(robot_name, output_folder, mesh_quality="Low Quality"):
     if robot is None:
         _log("ERROR: robot.py no se pudo cargar.")
         return
@@ -88,7 +88,7 @@ def on_execute(args):
         output_folder = inputs.itemById("outputFolder").value
 
         # Leer la calidad seleccionada en el DropDown (si existe)
-        mesh_quality = "Medium"
+        mesh_quality = "Low Quality"
         try:
             q_input = adsk.core.DropDownCommandInput.cast(
                 inputs.itemById("meshQuality")
@@ -158,13 +158,11 @@ def build_ui(cmd: adsk.core.Command):
         )
         q_items = quality_input.listItems
 
-        # NUEVO: modo ultra optimizado
-        q_items.add("Very Low Quality Optimized", False)
-        # Modos anteriores
-        q_items.add("Very low quality", False)
-        q_items.add("Low quality", False)
-        q_items.add("Medium quality", True)   # por defecto
-        q_items.add("Hight quality", False)
+        # SOLO DOS OPCIONES:
+        #  - Low Quality  -> Very Low Quality Optimized
+        #  - High Quality -> Display Mesh
+        q_items.add("Low Quality", True)   # por defecto
+        q_items.add("High Quality", False)
 
         _log("UI creada correctamente.")
 
@@ -184,7 +182,7 @@ def entry():
             cmd_def = _ui.commandDefinitions.addButtonDefinition(
                 "ACDC4Robot_CMD",
                 "Export ACDC4Robot",
-                "Exporta el diseño actual a URDF + STLs usando robot.py"
+                "Exporta el diseño actual a URDF + DAE usando robot.py"
             )
 
         # Registrar eventos
